@@ -1,5 +1,6 @@
 # Python
 venv/
+.venv/
 __pycache__/
 *.pyc
 *.pyo
@@ -8,6 +9,9 @@ __pycache__/
 env/
 *.egg-info/
 src/__pycache__/
+dist/
+build/
+*.egg
 
 # Input files (users should add their own)
 input/*
@@ -27,3 +31,13 @@ Thumbs.db
 .vscode/
 .idea/
 *.sublime-*
+
+# Databases
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+
+# Cache
+.cache/
+*.cache

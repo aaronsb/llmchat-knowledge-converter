@@ -1,0 +1,16 @@
+# Core dependencies for LLM Chat Knowledge Converter
+# Python 3.9+
+
+# JSON processing for large files
+ijson>=3.2.0
+
+# Natural language processing
+nltk>=3.8.0
+
+# Embedding generation for semantic search
+nomic>=3.0.0
+
+# Numerical operations for embeddings
+numpy>=1.24.0
+
+# Note: scikit-learn removed - was declared but unused in previous version

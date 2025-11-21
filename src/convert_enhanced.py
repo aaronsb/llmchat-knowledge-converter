@@ -701,6 +701,295 @@ def create_index(folder: Path, data_type: str):
     markdown_count = sum(1 for item in index_data if item.get('has_markdown'))
     print(f"  Created index with {len(index_data)} entries ({markdown_count} with markdown): {index_file}")
 
+def convert_claude_history(input_path: Path, output_path: Path,
+                          skip_tags: bool = False,
+                          generate_embeddings: bool = True) -> bool:
+    """
+    Convert Claude chat history to searchable knowledge base.
+
+    Args:
+        input_path: Path to extracted Claude export directory
+        output_path: Path to output vault directory
+        skip_tags: Skip interactive tag configuration
+        generate_embeddings: Generate semantic embeddings (requires Nomic)
+
+    Returns:
+        True if conversion succeeded, False otherwise
+    """
+    try:
+        from database import ConversationDatabase
+        from embeddings import EmbeddingGenerator, generate_conversation_embedding, NOMIC_AVAILABLE
+    except ImportError as e:
+        print(f"❌ Error importing required modules: {e}")
+        return False
+
+    try:
+        output_base = Path(output_path)
+        output_base.mkdir(parents=True, exist_ok=True)
+        input_dir = Path(input_path)
+
+        # Initialize keyword extractor and tag analyzer
+        keyword_extractor = KeywordExtractor()
+        tag_analyzer = TagAnalyzer()
+
+        # Initialize database
+        db_path = output_base / 'conversations.db'
+        db = ConversationDatabase(str(db_path))
+        print(f"📊 Creating database: {db_path}")
+
+        # Initialize embedding generator if requested
+        embedding_generator = None
+        if generate_embeddings:
+            if not NOMIC_AVAILABLE:
+                print("⚠️  Nomic not available, skipping embeddings")
+                generate_embeddings = False
+            else:
+                embedding_generator = EmbeddingGenerator()
+                print("🔮 Embedding generator initialized")
+
+        # Save user info
+        users_file = input_dir / 'users.json'
+        if users_file.exists():
+            print("\nCopying users.json...")
+            with open(users_file, 'r') as f:
+                users = json.load(f)
+            with open(output_base / 'users.json', 'w') as f:
+                json.dump(users, f, indent=2)
+    
+        # Convert conversations with database population
+        conversations_file = input_dir / 'conversations.json'
+        if conversations_file.exists():
+            print(f"\n🔄 Converting conversations...")
+            conversations_folder = output_base / 'conversations'
+            conversations_folder.mkdir(exist_ok=True)
+    
+            count = 0
+            markdown_count = 0
+    
+            # Collect all conversations for batch embedding
+            conversations_to_embed = []
+    
+            with open(conversations_file, 'rb') as f:
+                parser = ijson.items(f, 'item')
+    
+                for conversation in parser:
+                    try:
+                        conv_folder, conv_title, date_info = create_conversation_structure(conversation, conversations_folder)
+                        save_conversation(conversation, conv_folder, conv_title, date_info, keyword_extractor, tag_analyzer)
+                        count += 1
+    
+                        # Read metadata to populate database
+                        metadata_file = conv_folder / 'metadata.json'
+                        if metadata_file.exists():
+                            with open(metadata_file, 'r') as mf:
+                                metadata = json.load(mf)
+    
+                                if metadata.get('has_markdown_content'):
+                                    markdown_count += 1
+    
+                                # Insert conversation into database
+                                relative_path = str(conv_folder.relative_to(output_base / 'conversations'))
+                                conv_id = db.add_conversation(
+                                    uuid=metadata['uuid'],
+                                    name=metadata['name'],
+                                    created_at=metadata['created_at'],
+                                    relative_path=relative_path,
+                                    source='claude',
+                                    updated_at=metadata.get('updated_at'),
+                                    message_count=metadata['message_count'],
+                                    has_markdown=metadata.get('has_markdown_content', False)
+                                )
+    
+                                # Add keywords
+                                keywords = metadata.get('keywords', [])
+                                if keywords:
+                                    keyword_tuples = [(kw, 1.0) for kw in keywords]
+                                    db.add_keywords(conv_id, keyword_tuples)
+    
+                                # Add messages to database
+                                messages_dir = conv_folder / 'messages'
+                                if messages_dir.exists():
+                                    # Read original conversation data for message content
+                                    for idx, msg in enumerate(conversation.get('chat_messages', [])):
+                                        sender = msg.get('sender', 'unknown')
+                                        content_parts = []
+                                        for content in msg.get('content', []):
+                                            if isinstance(content, dict) and content.get('type') == 'text':
+                                                content_parts.append(content.get('text', ''))
+    
+                                        full_content = '\n'.join(content_parts)
+                                        has_code = '```' in full_content
+    
+                                        db.add_message(
+                                            conversation_id=conv_id,
+                                            sender=sender,
+                                            content=full_content,
+                                            index_in_conversation=idx,
+                                            message_uuid=msg.get('uuid'),
+                                            created_at=msg.get('created_at'),
+                                            has_code=has_code
+                                        )
+    
+                                # Collect for embedding generation
+                                if generate_embeddings:
+                                    first_message = None
+                                    if conversation.get('chat_messages'):
+                                        first_msg = conversation['chat_messages'][0]
+                                        content_parts = []
+                                        for content in first_msg.get('content', []):
+                                            if isinstance(content, dict) and content.get('type') == 'text':
+                                                content_parts.append(content.get('text', ''))
+                                        first_message = '\n'.join(content_parts)[:500]
+    
+                                    embed_text = generate_conversation_embedding(
+                                        title=metadata['name'],
+                                        keywords=keywords,
+                                        first_message=first_message
+                                    )
+                                    conversations_to_embed.append((conv_id, embed_text))
+    
+                        if count % 100 == 0:
+                            print(f"  Processed {count} conversations ({markdown_count} with markdown)...", end='\r')
+    
+                    except Exception as e:
+                        print(f"\n⚠️  Error processing conversation {conversation.get('uuid', 'unknown')}: {e}")
+    
+            print(f"  Converted {count} conversations total ({markdown_count} with markdown content)    ")
+    
+            # Generate embeddings in batch
+            if generate_embeddings and conversations_to_embed:
+                print(f"\n🔮 Generating embeddings for {len(conversations_to_embed)} conversations...")
+                texts = [text for _, text in conversations_to_embed]
+                embeddings = embedding_generator.generate_batch(texts, task_type='search_document')
+    
+                for (conv_id, _), embedding in zip(conversations_to_embed, embeddings):
+                    db.add_embedding(conv_id, embedding, 'nomic-embed-text-v1.5')
+    
+                print("✅ Embeddings generated and stored")
+    
+        # Convert projects
+        projects_file = input_dir / 'projects.json'
+        if projects_file.exists():
+            convert_projects(str(projects_file), output_base, keyword_extractor, tag_analyzer)
+    
+            # Also add projects to database
+            print("📊 Adding projects to database...")
+            projects_folder = output_base / 'projects'
+            if projects_folder.exists():
+                for project_dir in projects_folder.iterdir():
+                    if not project_dir.is_dir() or project_dir.name.startswith('.'):
+                        continue
+    
+                    metadata_file = project_dir / 'metadata.json'
+                    if metadata_file.exists():
+                        with open(metadata_file, 'r') as f:
+                            metadata = json.load(f)
+                            relative_path = str(project_dir.relative_to(output_base / 'projects'))
+                            db.add_project(
+                                uuid=metadata['uuid'],
+                                name=metadata['name'],
+                                created_at=metadata['created_at'],
+                                relative_path=relative_path,
+                                description=metadata.get('description')
+                            )
+    
+        # Show database statistics
+        stats = db.get_statistics()
+        print(f"\n📊 Database populated:")
+        print(f"   - {stats['total_conversations']} conversations")
+        print(f"   - {stats['total_messages']} messages")
+        print(f"   - {stats['total_keywords']} unique keywords")
+        if generate_embeddings:
+            print(f"   - {stats['conversations_with_embeddings']} conversations with embeddings")
+        if stats['total_projects'] > 0:
+            print(f"   - {stats['total_projects']} projects")
+    
+        # Create summary
+        summary = {
+            'created_at': datetime.now().isoformat(),
+            'source_files': {
+                'conversations.json': conversations_file.exists(),
+                'projects.json': projects_file.exists(),
+                'users.json': users_file.exists()
+            },
+            'output_structure': {
+                'conversations': 'conversations/{year}/{month}/{day}/{conversation_name}/',
+                'projects': 'projects/{project_name}/',
+                'database': 'conversations.db',
+                'markdown_extraction': True,
+                'code_snippet_extraction': True,
+                'keyword_extraction': True,
+                'embeddings_generated': generate_embeddings
+            },
+            'features': [
+                'Enhanced markdown titles with full conversation context',
+                'Automatic keyword extraction and hashtag generation',
+                'Human-readable titles throughout',
+                'Markdown files saved as .md with proper headers',
+                'Code blocks extracted to separate files',
+                'Keywords indexed for discovery and search',
+                'SQLite database with full-text search',
+                'Semantic embeddings for similarity search' if generate_embeddings else None
+            ],
+            'statistics': stats
+        }
+    
+        with open(output_base / 'conversion_summary.json', 'w') as f:
+            json.dump(summary, f, indent=2)
+    
+        # Tag analysis and Obsidian config
+        if not skip_tags:
+            print("\n" + "="*60)
+            print("Generating Obsidian graph configuration...")
+            print("="*60)
+    
+            # Scan all markdown files for complete tag analysis
+            tag_analyzer.scan_markdown_files_for_tags(output_base)
+    
+            # Interactive water level adjustment for both tags and file patterns
+            tag_water_level, file_water_level, tag_color_scheme, file_color_scheme = tag_analyzer.interactive_water_level_adjustment()
+    
+            # Generate Obsidian config files with dual grouping
+            print(f"\nCreating Obsidian configuration with dual-layer grouping...")
+            print(f"Using {tag_color_scheme} colors for tags and {file_color_scheme} colors for file patterns")
+            tag_analyzer.create_obsidian_config(output_base, tag_water_level, file_water_level,
+                                              tag_color_scheme, file_color_scheme)
+    
+            # Save analysis report
+            report_file = tag_analyzer.save_analysis_report(output_base, tag_water_level, file_water_level,
+                                                           tag_color_scheme, file_color_scheme)
+            print(f"Tag analysis report saved to: {report_file}")
+        else:
+            # Create basic Obsidian config without interactive setup
+            print("\n📝 Creating basic Obsidian configuration...")
+            tag_analyzer.create_obsidian_config(output_base, 30, 30, 'rainbow', 'ocean')
+    
+        print("\n" + "="*60)
+        print("✅ CONVERSION COMPLETE!")
+        print("="*60)
+        print(f"Your knowledge base is ready in: {output_base}")
+        print(f"\nDatabase: {db_path}")
+        print(f"  - Full-text search enabled")
+        print(f"  - {stats['total_conversations']} conversations indexed")
+        if generate_embeddings:
+            print(f"  - Semantic search ready")
+        print("\nTo search your conversations:")
+        print(f"  python src/search_chats.py {output_base} \"your query\"")
+        print("\nTo use with Obsidian:")
+        print("1. Open Obsidian")
+        print("2. Open this folder as a vault")
+        print("3. Open Graph View to see your color-coded knowledge network!")
+
+        db.close()
+        return True
+
+    except Exception as e:
+        print(f"\n❌ Conversion failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+
 def main():
     # Get output directory from command line argument or use default
     if len(sys.argv) > 1:
