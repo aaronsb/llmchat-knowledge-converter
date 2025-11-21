@@ -206,11 +206,13 @@ class ConversationSearcher:
                     paths.extend([str(f.resolve()) for f in md_files])
 
             elif granularity == 'message':
-                # Return individual message files
+                # Return individual message files (both .md and .json)
                 messages_dir = conv_path / 'messages'
                 if messages_dir.exists():
-                    msg_files = list(messages_dir.glob('*.md'))
-                    paths.extend([str(f.resolve()) for f in msg_files])
+                    md_files = list(messages_dir.glob('*.md'))
+                    json_files = list(messages_dir.glob('*.json'))
+                    all_files = md_files + json_files
+                    paths.extend([str(f.resolve()) for f in all_files])
 
         return paths
 

@@ -177,7 +177,7 @@ def save_message_files(message: Dict[str, Any], idx: int, messages_folder: Path,
     # Extract and save markdown if detected
     if has_markdown and message.get('text'):
         md_filename = f"{conv_title.replace(' ', '_')}-{idx:03d}_{message['sender'].title()}_Message.md"
-        md_path = conv_folder / md_filename
+        md_path = messages_folder / md_filename  # Save to messages/ directory
         
         # Add metadata to markdown
         markdown_content = enhance_markdown_content(
@@ -194,9 +194,9 @@ def save_message_files(message: Dict[str, Any], idx: int, messages_folder: Path,
         md_path.write_text(markdown_content, encoding='utf-8')
         markdown_file = md_filename
         msg_metadata['markdown_file'] = md_filename
-        
-        # Extract code snippets
-        snippets = extract_code_snippets(message['text'], conv_folder)
+
+        # Extract code snippets (also save to messages/ directory)
+        snippets = extract_code_snippets(message['text'], messages_folder)
         if snippets:
             msg_metadata['code_snippets'] = snippets
     
